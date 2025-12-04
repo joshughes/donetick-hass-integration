@@ -184,7 +184,8 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
             return tasks
 
         now_local = dt_util.now()
-        end_of_today = dt_util.end_of_local_day(now_local)
+        start_of_today = dt_util.start_of_local_day(now_local)
+        end_of_today = start_of_today + timedelta(days=1)
         filtered = []
         for task in tasks:
             if task.next_due_date is None:
