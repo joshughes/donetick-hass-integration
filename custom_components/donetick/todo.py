@@ -209,12 +209,15 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
                 # Determine who should complete this task using smart logic
                 completed_by = await self._get_completion_user_id(client, item, context)
                 
-                res = await client.async_complete_task(task_id, completed_by)
-                if res.frequency_type != "once":
-                    _LOGGER.debug("Task %s is recurring, updating next due date", res.name)
-                    item.status = TodoItemStatus.NEEDS_ACTION
-                    item.due = res.next_due_date
-                    self.async_update_todo_item(item)
+                updated_task = await client.async_complete_task(
+                    task_id,
+                    completed_by
+                )
+                await self._apply_task_update(updated_task)
+                _LOGGER.debug(
+                    "Task %d completion synced with coordinator cache",
+                    task_id
+                )
             else:
                 # Update task properties (summary, description, due date)
                 _LOGGER.debug("Updating task %d properties", task_id)
@@ -224,19 +227,20 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
                 if item.due:
                     due_date = item.due.isoformat()
                 
-                await client.async_update_task(
+                updated_task = await client.async_update_task(
                     task_id=task_id,
                     name=item.summary,
                     description=item.description,
                     due_date=due_date
                 )
+                await self._apply_task_update(updated_task)
                 _LOGGER.info("Updated task %d", task_id)
                 
         except Exception as e:
             _LOGGER.error("Error updating task %d: %s", task_id, e)
             raise
         
-        await self.coordinator.async_refresh()
+        await self.coordinator.async_request_refresh()
 
     async def async_delete_todo_items(self, uids: list[str]) -> None:
         """Delete todo items."""
@@ -253,6 +257,7 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
                 success = await client.async_delete_task(task_id)
                 if success:
                     _LOGGER.info("Deleted task %d", task_id)
+                    await self._remove_task_from_cache(task_id)
                 else:
                     _LOGGER.error("Failed to delete task %d", task_id)
                     
@@ -260,15 +265,21 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
                 _LOGGER.error("Error deleting task %s: %s", uid, e)
                 raise
         
-        await self.coordinator.async_refresh()
+        await self.coordinator.async_request_refresh()
     
-    async def _get_completion_user_id(self, client, item, context=None) -> int | None:
+    async def _get_completion_user_id(
+        self, client, item, context=None
+    ) -> int | None:
         """Determine who should complete this task using smart logic."""
         
         # Option 1: Context-based completion
         # If this is an assignee-specific list, use that assignee
         if hasattr(self, '_member'):
-            _LOGGER.debug("Using assignee from specific list: %s (ID: %d)", self._member.display_name, self._member.user_id)
+            _LOGGER.debug(
+                "Using assignee from specific list: %s (ID: %d)",
+                self._member.display_name,
+                self._member.user_id
+            )
             return self._member.user_id
         
         # If completing from "All Tasks", find the task's original assignee
@@ -276,7 +287,10 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
         if self.coordinator.data:
             for task in self.coordinator.data:
                 if task.id == task_id and task.assigned_to:
-                    _LOGGER.debug("Using task's original assignee: %d", task.assigned_to)
+                    _LOGGER.debug(
+                        "Using task's original assignee: %d",
+                        task.assigned_to
+                    )
                     return task.assigned_to
         
         # No default user - rely on context-based or task assignee
@@ -284,10 +298,36 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
         _LOGGER.debug("No completion user determined, using default")
         return None
 
+    async def _apply_task_update(self, updated_task: DonetickTask) -> None:
+        """Merge updated task into coordinator cache and notify listeners."""
+        current_tasks = list(self.coordinator.data or [])
+        replaced = False
+        for index, task in enumerate(current_tasks):
+            if task.id == updated_task.id:
+                current_tasks[index] = updated_task
+                replaced = True
+                break
+        if not replaced:
+            current_tasks.append(updated_task)
+
+        await self.coordinator.async_set_updated_data(current_tasks)
+
+    async def _remove_task_from_cache(self, task_id: int) -> None:
+        """Remove a task from the coordinator cache and notify listeners."""
+        current_tasks = [
+            task for task in (self.coordinator.data or [])
+            if task.id != task_id
+        ]
+
+        await self.coordinator.async_set_updated_data(current_tasks)
+
+
 class DonetickAllTasksList(DonetickTodoListBase):
     """Donetick All Tasks List entity."""
 
-    def __init__(self, coordinator: DataUpdateCoordinator, config_entry: ConfigEntry) -> None:
+    def __init__(
+        self, coordinator: DataUpdateCoordinator, config_entry: ConfigEntry
+    ) -> None:
         """Initialize the All Tasks List."""
         super().__init__(coordinator, config_entry)
         self._attr_unique_id = f"dt_{config_entry.entry_id}_all_tasks"
@@ -300,24 +340,38 @@ class DonetickAllTasksList(DonetickTodoListBase):
 class DonetickAssigneeTasksList(DonetickTodoListBase):
     """Donetick Assignee-specific Tasks List entity."""
 
-    def __init__(self, coordinator: DataUpdateCoordinator, config_entry: ConfigEntry, member: DonetickMember) -> None:
+    def __init__(
+        self,
+        coordinator: DataUpdateCoordinator,
+        config_entry: ConfigEntry,
+        member: DonetickMember
+    ) -> None:
         """Initialize the Assignee Tasks List."""
         super().__init__(coordinator, config_entry)
         self._member = member
-        self._attr_unique_id = f"dt_{config_entry.entry_id}_{member.user_id}_tasks"
+        self._attr_unique_id = (
+            f"dt_{config_entry.entry_id}_{member.user_id}_tasks"
+        )
         self._attr_name = f"{member.display_name}'s Tasks"
 
     def _filter_tasks(self, tasks):
         """Return tasks assigned to this member."""
-        return [task for task in tasks if task.is_active and task.assigned_to == self._member.user_id]
+        return [
+            task for task in tasks
+            if task.is_active and task.assigned_to == self._member.user_id
+        ]
 
 # Keep the old class for backward compatibility
+
+
 class DonetickTodoListEntity(DonetickAllTasksList):
     """Donetick Todo List entity."""
     
     """Legacy Donetick Todo List entity for backward compatibility."""
     
-    def __init__(self, coordinator: DataUpdateCoordinator, config_entry: ConfigEntry) -> None:
+    def __init__(
+        self, coordinator: DataUpdateCoordinator, config_entry: ConfigEntry
+    ) -> None:
         """Initialize the Todo List."""
         super().__init__(coordinator, config_entry)
         self._attr_unique_id = f"dt_{config_entry.entry_id}"
