@@ -1,6 +1,6 @@
 """Todo for Donetick integration."""
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from homeassistant.components.todo import (
@@ -104,18 +104,66 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
         """Initialize the Todo List."""
         super().__init__(coordinator)
         self._config_entry = config_entry
+        raw_show_due_in = config_entry.options.get(
+            CONF_SHOW_DUE_IN,
+            config_entry.data.get(CONF_SHOW_DUE_IN, 7),
+        )
+        self._show_due_in_days = self._coerce_show_due_in(raw_show_due_in)
 
     def _filter_tasks(self, tasks):
         """Filter tasks based on entity type. Override in subclasses."""
         return tasks
 
+    @staticmethod
+    def _coerce_show_due_in(value: Any) -> int | None:
+        """Validate the show_due_in configuration value."""
+        if value is None:
+            return None
+        try:
+            coerced = max(0, int(value))
+        except (TypeError, ValueError):
+            _LOGGER.warning(
+                "Invalid show_due_in value '%s'. "
+                "Falling back to 7 days.",
+                value,
+            )
+            return 7
+        return coerced
+
+    @staticmethod
+    def _normalize_due_date(due_date: datetime) -> datetime:
+        """Return a timezone-aware due date in UTC."""
+        if due_date.tzinfo is None:
+            return due_date.replace(tzinfo=timezone.utc)
+        return due_date.astimezone(timezone.utc)
+
+    def _filter_by_due_window(self, tasks):
+        """Filter tasks so only those within the configured window remain."""
+        if self._show_due_in_days is None:
+            return tasks
+
+        now_utc = datetime.now(timezone.utc)
+        cutoff = now_utc + timedelta(days=self._show_due_in_days)
+        filtered = []
+        for task in tasks:
+            if task.next_due_date is None:
+                filtered.append(task)
+                continue
+
+            normalized_due = self._normalize_due_date(task.next_due_date)
+            if normalized_due <= cutoff:
+                filtered.append(task)
+
+        return filtered
+
     @property
-    def todo_items(self) -> list[TodoItem] | None: 
+    def todo_items(self) -> list[TodoItem] | None:
         """Return a list of todo items."""
         if self.coordinator.data is None:
             return None
         
         filtered_tasks = self._filter_tasks(self.coordinator.data)
+        filtered_tasks = self._filter_by_due_window(filtered_tasks)
         return [
             TodoItem(
                 summary=task.name,
@@ -126,7 +174,9 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
             ) for task in filtered_tasks if task.is_active
         ]
 
-    def get_status(self, due_date: datetime, is_active: bool) -> TodoItemStatus:
+    def get_status(
+        self, due_date: datetime, is_active: bool
+    ) -> TodoItemStatus:
         """Return the status of the task."""
         if not is_active:
             return TodoItemStatus.COMPLETED
@@ -139,6 +189,7 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
             "config_entry_id": self._config_entry.entry_id,
             "donetick_url": self._config_entry.data[CONF_URL],
         }
+        attributes["show_due_in_days"] = self._show_due_in_days
         
         # Add circle members data for custom card user selection
         if hasattr(self, '_circle_members'):
@@ -179,7 +230,11 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
                 due_date=due_date,
                 created_by=created_by
             )
-            _LOGGER.info("Created task '%s' with ID %d", item.summary, result.id)
+            _LOGGER.info(
+                "Created task '%s' with ID %d",
+                item.summary,
+                result.id,
+            )
             
         except Exception as e:
             _LOGGER.error("Failed to create task '%s': %s", item.summary, e)
@@ -187,7 +242,9 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
         
         await self.coordinator.async_refresh()
 
-    async def async_update_todo_item(self, item: TodoItem, context = None) -> None:
+    async def async_update_todo_item(
+        self, item: TodoItem, context: Any | None = None
+    ) -> None:
         """Update a todo item."""
         _LOGGER.debug("Update todo item: %s %s", item.uid, item.status)
         if not self.coordinator.data:
@@ -207,13 +264,18 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
                 # Complete the task
                 _LOGGER.debug("Completing task %s", item.uid)
                 # Determine who should complete this task using smart logic
-                completed_by = await self._get_completion_user_id(client, item, context)
-                
-                updated_task = await client.async_complete_task(
-                    task_id,
-                    completed_by
+                completed_by = await self._get_completion_user_id(
+                    client, item, context
                 )
-                await self._apply_task_update(updated_task)
+                
+                if completed_by is not None:
+                    updated_task = await client.async_complete_task(
+                        task_id,
+                        completed_by,
+                    )
+                else:
+                    updated_task = await client.async_complete_task(task_id)
+                self._apply_task_update(updated_task)
                 _LOGGER.debug(
                     "Task %d completion synced with coordinator cache",
                     task_id
@@ -223,17 +285,20 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
                 _LOGGER.debug("Updating task %d properties", task_id)
                 
                 # Convert due date to RFC3339 format if provided
-                due_date = None
+                due_date: str | None = None
                 if item.due:
                     due_date = item.due.isoformat()
-                
-                updated_task = await client.async_update_task(
-                    task_id=task_id,
-                    name=item.summary,
-                    description=item.description,
-                    due_date=due_date
-                )
-                await self._apply_task_update(updated_task)
+
+                update_kwargs: dict[str, Any] = {
+                    "task_id": task_id,
+                    "name": item.summary,
+                    "description": item.description,
+                }
+                if due_date is not None:
+                    update_kwargs["due_date"] = due_date
+
+                updated_task = await client.async_update_task(**update_kwargs)
+                self._apply_task_update(updated_task)
                 _LOGGER.info("Updated task %d", task_id)
                 
         except Exception as e:
@@ -257,7 +322,7 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
                 success = await client.async_delete_task(task_id)
                 if success:
                     _LOGGER.info("Deleted task %d", task_id)
-                    await self._remove_task_from_cache(task_id)
+                    self._remove_task_from_cache(task_id)
                 else:
                     _LOGGER.error("Failed to delete task %d", task_id)
                     
@@ -298,7 +363,7 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
         _LOGGER.debug("No completion user determined, using default")
         return None
 
-    async def _apply_task_update(self, updated_task: DonetickTask) -> None:
+    def _apply_task_update(self, updated_task: DonetickTask) -> None:
         """Merge updated task into coordinator cache and notify listeners."""
         current_tasks = list(self.coordinator.data or [])
         replaced = False
@@ -310,16 +375,16 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
         if not replaced:
             current_tasks.append(updated_task)
 
-        await self.coordinator.async_set_updated_data(current_tasks)
+        self.coordinator.async_set_updated_data(current_tasks)
 
-    async def _remove_task_from_cache(self, task_id: int) -> None:
+    def _remove_task_from_cache(self, task_id: int) -> None:
         """Remove a task from the coordinator cache and notify listeners."""
         current_tasks = [
             task for task in (self.coordinator.data or [])
             if task.id != task_id
         ]
 
-        await self.coordinator.async_set_updated_data(current_tasks)
+        self.coordinator.async_set_updated_data(current_tasks)
 
 
 class DonetickAllTasksList(DonetickTodoListBase):
@@ -336,6 +401,7 @@ class DonetickAllTasksList(DonetickTodoListBase):
     def _filter_tasks(self, tasks):
         """Return all active tasks."""
         return [task for task in tasks if task.is_active]
+
 
 class DonetickAssigneeTasksList(DonetickTodoListBase):
     """Donetick Assignee-specific Tasks List entity."""
