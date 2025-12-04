@@ -1,4 +1,5 @@
 """Todo for Donetick integration."""
+import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -7,7 +8,7 @@ from homeassistant.components.todo import (
     TodoItem,
     TodoItemStatus,
     TodoListEntity,
-    TodoListEntityFeature, 
+    TodoListEntityFeature,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -35,6 +36,7 @@ from .model import DonetickTask, DonetickMember
 
 _LOGGER = logging.getLogger(__name__)
 
+
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
@@ -48,7 +50,10 @@ async def async_setup_entry(
         session,
     )
 
-    refresh_interval_seconds = config_entry.data.get(CONF_REFRESH_INTERVAL, DEFAULT_REFRESH_INTERVAL)
+    refresh_interval_seconds = config_entry.data.get(
+        CONF_REFRESH_INTERVAL,
+        DEFAULT_REFRESH_INTERVAL,
+    )
     coordinator = DataUpdateCoordinator(
         hass,
         _LOGGER,
@@ -60,58 +65,77 @@ async def async_setup_entry(
     await coordinator.async_config_entry_first_refresh()
 
     entities = []
-    
+
     # Create unified list if enabled (check options first, then data)
-    create_unified = config_entry.options.get(CONF_CREATE_UNIFIED_LIST, config_entry.data.get(CONF_CREATE_UNIFIED_LIST, True))
+    create_unified = config_entry.options.get(
+        CONF_CREATE_UNIFIED_LIST,
+        config_entry.data.get(CONF_CREATE_UNIFIED_LIST, True),
+    )
     if create_unified:
         entity = DonetickAllTasksList(coordinator, config_entry)
         entity._circle_members = []  # Will be set after we get members
         entities.append(entity)
-    
+
     # Get circle members for all entities (useful for custom cards)
     circle_members = []
     try:
         circle_members = await client.async_get_circle_members()
         _LOGGER.debug("Found %d circle members", len(circle_members))
-        
+
         # Set circle members on unified entity if it exists
-        if entities and hasattr(entities[0], '_circle_members'):
+        if entities and hasattr(entities[0], "_circle_members"):
             entities[0]._circle_members = circle_members
-            
+
     except Exception as e:
         _LOGGER.error("Failed to get circle members: %s", e)
-    
+
     # Create per-assignee lists if enabled (check options first, then data)
-    create_assignee_lists = config_entry.options.get(CONF_CREATE_ASSIGNEE_LISTS, config_entry.data.get(CONF_CREATE_ASSIGNEE_LISTS, False))
+    create_assignee_lists = config_entry.options.get(
+        CONF_CREATE_ASSIGNEE_LISTS,
+        config_entry.data.get(CONF_CREATE_ASSIGNEE_LISTS, False),
+    )
     if create_assignee_lists:
         _LOGGER.debug("Assignee lists enabled in config")
         for member in circle_members:
             if member.is_active:
-                _LOGGER.debug("Creating entity for member: %s (ID: %d)", member.display_name, member.user_id)
-                entity = DonetickAssigneeTasksList(coordinator, config_entry, member)
+                _LOGGER.debug(
+                    "Creating entity for member: %s (ID: %d)",
+                    member.display_name,
+                    member.user_id,
+                )
+                entity = DonetickAssigneeTasksList(
+                    coordinator,
+                    config_entry,
+                    member,
+                )
                 entity._circle_members = circle_members
                 entities.append(entity)
     else:
         _LOGGER.debug("Assignee lists not enabled in config")
-    
+
     _LOGGER.debug("Creating %d total entities", len(entities))
     async_add_entities(entities)
 
 # Remove old assignee detection function since we now use circle members
 
+
 class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
     """Base class for Donetick Todo List entities."""
-    
+
     _attr_supported_features = (
-        TodoListEntityFeature.CREATE_TODO_ITEM | 
-        TodoListEntityFeature.UPDATE_TODO_ITEM |
-        TodoListEntityFeature.DELETE_TODO_ITEM |
-        TodoListEntityFeature.SET_DESCRIPTION_ON_ITEM |
-        TodoListEntityFeature.SET_DUE_DATE_ON_ITEM |
-        TodoListEntityFeature.SET_DUE_DATETIME_ON_ITEM
+        TodoListEntityFeature.CREATE_TODO_ITEM
+        | TodoListEntityFeature.UPDATE_TODO_ITEM
+        | TodoListEntityFeature.DELETE_TODO_ITEM
+        | TodoListEntityFeature.SET_DESCRIPTION_ON_ITEM
+        | TodoListEntityFeature.SET_DUE_DATE_ON_ITEM
+        | TodoListEntityFeature.SET_DUE_DATETIME_ON_ITEM
     )
 
-    def __init__(self, coordinator: DataUpdateCoordinator, config_entry: ConfigEntry) -> None:
+    def __init__(
+        self,
+        coordinator: DataUpdateCoordinator,
+        config_entry: ConfigEntry,
+    ) -> None:
         """Initialize the Todo List."""
         super().__init__(coordinator)
         self._config_entry = config_entry
@@ -135,6 +159,15 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
     def _filter_tasks(self, tasks):
         """Filter tasks based on entity type. Override in subclasses."""
         return tasks
+
+    def _get_display_tasks(self) -> list[DonetickTask]:
+        """Return tasks that should be exposed to Home Assistant."""
+        if not self.coordinator or not self.coordinator.data:
+            return []
+
+        filtered_tasks = self._filter_tasks(self.coordinator.data)
+        filtered_tasks = self._filter_by_due_window(filtered_tasks)
+        return [task for task in filtered_tasks if task.is_active]
 
     @staticmethod
     def _coerce_show_due_in(value: Any) -> int | None:
@@ -221,11 +254,13 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
     @property
     def todo_items(self) -> list[TodoItem] | None:
         """Return a list of todo items."""
-        if self.coordinator.data is None:
+        if not self.coordinator or self.coordinator.data is None:
             return None
-        
-        filtered_tasks = self._filter_tasks(self.coordinator.data)
-        filtered_tasks = self._filter_by_due_window(filtered_tasks)
+
+        display_tasks = self._get_display_tasks()
+        if not display_tasks:
+            return []
+
         return [
             TodoItem(
                 summary=task.name,
@@ -233,11 +268,12 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
                 status=self.get_status(task.next_due_date, task.is_active),
                 due=task.next_due_date,
                 description=task.description or ""
-            ) for task in filtered_tasks if task.is_active
+            )
+            for task in display_tasks
         ]
 
     def get_status(
-        self, due_date: datetime, is_active: bool
+        self, due_date: datetime | None, is_active: bool
     ) -> TodoItemStatus:
         """Return the status of the task."""
         if not is_active:
@@ -264,6 +300,35 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
                 }
                 for member in self._circle_members
             ]
+
+        display_tasks = self._get_display_tasks()
+        if display_tasks:
+            sorted_tasks = sorted(display_tasks, key=lambda task: task.id)
+            signature_parts: list[str] = []
+            for task in sorted_tasks:
+                due_part = (
+                    task.next_due_date.isoformat()
+                    if task.next_due_date
+                    else ""
+                )
+                updated_part = getattr(task, "updated_at", "") or ""
+                signature_parts.append(
+                    ":".join(
+                        (
+                            str(task.id),
+                            due_part,
+                            str(int(task.is_active)),
+                            updated_part,
+                        )
+                    )
+                )
+
+            signature_source = "|".join(signature_parts)
+            attributes["tasks_checksum"] = hashlib.sha256(
+                signature_source.encode()
+            ).hexdigest()[:12]
+        else:
+            attributes["tasks_checksum"] = None
         
         return attributes
 
@@ -278,21 +343,25 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
         
         try:
             # Determine the created_by user for assignee lists
-            created_by = None
-            if hasattr(self, '_member'):
+            created_by: int | None = None
+            if hasattr(self, "_member"):
                 created_by = self._member.user_id
-            
+
             # Convert due date to RFC3339 format if provided
-            due_date = None
+            due_date: str | None = None
             if item.due:
                 due_date = item.due.isoformat()
-            
-            result = await client.async_create_task(
-                name=item.summary,
-                description=item.description,
-                due_date=due_date,
-                created_by=created_by
-            )
+
+            create_kwargs: dict[str, Any] = {
+                "name": item.summary,
+                "description": item.description,
+            }
+            if due_date is not None:
+                create_kwargs["due_date"] = due_date
+            if created_by is not None:
+                create_kwargs["created_by"] = created_by
+
+            result = await client.async_create_task(**create_kwargs)
             _LOGGER.info(
                 "Created task '%s' with ID %d",
                 item.summary,
