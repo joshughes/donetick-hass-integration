@@ -120,12 +120,17 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
             config_entry.data.get(CONF_SHOW_DUE_IN, 7),
         )
         self._show_due_in_days = self._coerce_show_due_in(raw_show_due_in)
-        self._show_only_today = bool(
-            config_entry.options.get(
-                CONF_SHOW_ONLY_TODAY,
-                config_entry.data.get(CONF_SHOW_ONLY_TODAY, False),
-            )
+        raw_show_only_today = config_entry.options.get(
+            CONF_SHOW_ONLY_TODAY,
+            config_entry.data.get(CONF_SHOW_ONLY_TODAY, False),
         )
+        if isinstance(raw_show_only_today, bool):
+            self._show_only_today = raw_show_only_today
+        elif isinstance(raw_show_only_today, str):
+            normalized_value = raw_show_only_today.lower()
+            self._show_only_today = normalized_value in ("true", "1", "yes")
+        else:
+            self._show_only_today = bool(raw_show_only_today)
 
     def _filter_tasks(self, tasks):
         """Filter tasks based on entity type. Override in subclasses."""
@@ -178,17 +183,37 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
         if not self._show_only_today:
             return tasks
 
-        today_local = dt_util.now().date()
+        now_local = dt_util.now()
+        end_of_today = dt_util.end_of_local_day(now_local)
         filtered = []
         for task in tasks:
             if task.next_due_date is None:
+                _LOGGER.debug(
+                    "Including task %s with no due date for today-only filter",
+                    task.id,
+                )
                 filtered.append(task)
                 continue
 
             normalized_due = self._normalize_due_date(task.next_due_date)
             local_due = dt_util.as_local(normalized_due)
-            if local_due.date() <= today_local:
+            if local_due <= end_of_today:
+                _LOGGER.debug(
+                    "Including task %s due %s (local %s) <= end of today %s",
+                    task.id,
+                    normalized_due,
+                    local_due,
+                    end_of_today,
+                )
                 filtered.append(task)
+            else:
+                _LOGGER.debug(
+                    "Excluding task %s due %s (local %s) > end of today %s",
+                    task.id,
+                    normalized_due,
+                    local_due,
+                    end_of_today,
+                )
 
         return filtered
 
