@@ -24,7 +24,7 @@
                         "description": "Show tasks due within this many days (0 shows all tasks)"
                     },
                     "show_only_today": {
-                        "name": "Only show tasks due today",
+                        "name": "Show tasks due today or overdue",
                         "description": "Hide tasks until their calendar day begins"
                     },
                     "create_unified_list": {
@@ -50,7 +50,7 @@
                         "description": "Show tasks due within this many days (0 shows all tasks)"
                     },
                     "show_only_today": {
-                        "name": "Only show tasks due today",
+                        "name": "Show tasks due today or overdue",
                         "description": "Hide tasks until their calendar day begins"
                     },
                     "create_unified_list": {

@@ -174,7 +174,7 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
         return self._filter_today_only(filtered)
 
     def _filter_today_only(self, tasks):
-        """Filter tasks to those due today when configured."""
+        """Filter tasks to those due today, overdue, or without due dates."""
         if not self._show_only_today:
             return tasks
 
@@ -187,7 +187,7 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
 
             normalized_due = self._normalize_due_date(task.next_due_date)
             local_due = dt_util.as_local(normalized_due)
-            if local_due.date() == today_local:
+            if local_due.date() <= today_local:
                 filtered.append(task)
 
         return filtered
