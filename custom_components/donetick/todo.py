@@ -17,8 +17,19 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
 )
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN, CONF_URL, CONF_TOKEN, CONF_SHOW_DUE_IN, CONF_CREATE_UNIFIED_LIST, CONF_CREATE_ASSIGNEE_LISTS, CONF_REFRESH_INTERVAL, DEFAULT_REFRESH_INTERVAL
+from .const import (
+    DOMAIN,
+    CONF_URL,
+    CONF_TOKEN,
+    CONF_SHOW_DUE_IN,
+    CONF_SHOW_ONLY_TODAY,
+    CONF_CREATE_UNIFIED_LIST,
+    CONF_CREATE_ASSIGNEE_LISTS,
+    CONF_REFRESH_INTERVAL,
+    DEFAULT_REFRESH_INTERVAL,
+)
 from .api import DonetickApiClient
 from .model import DonetickTask, DonetickMember
 
@@ -109,6 +120,12 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
             config_entry.data.get(CONF_SHOW_DUE_IN, 7),
         )
         self._show_due_in_days = self._coerce_show_due_in(raw_show_due_in)
+        self._show_only_today = bool(
+            config_entry.options.get(
+                CONF_SHOW_ONLY_TODAY,
+                config_entry.data.get(CONF_SHOW_ONLY_TODAY, False),
+            )
+        )
 
     def _filter_tasks(self, tasks):
         """Filter tasks based on entity type. Override in subclasses."""
@@ -140,7 +157,7 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
     def _filter_by_due_window(self, tasks):
         """Filter tasks so only those within the configured window remain."""
         if self._show_due_in_days is None:
-            return tasks
+            return self._filter_today_only(tasks)
 
         now_utc = datetime.now(timezone.utc)
         cutoff = now_utc + timedelta(days=self._show_due_in_days)
@@ -152,6 +169,25 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
 
             normalized_due = self._normalize_due_date(task.next_due_date)
             if normalized_due <= cutoff:
+                filtered.append(task)
+
+        return self._filter_today_only(filtered)
+
+    def _filter_today_only(self, tasks):
+        """Filter tasks to those due today when configured."""
+        if not self._show_only_today:
+            return tasks
+
+        today_local = dt_util.now().date()
+        filtered = []
+        for task in tasks:
+            if task.next_due_date is None:
+                filtered.append(task)
+                continue
+
+            normalized_due = self._normalize_due_date(task.next_due_date)
+            local_due = dt_util.as_local(normalized_due)
+            if local_due.date() == today_local:
                 filtered.append(task)
 
         return filtered
@@ -190,6 +226,7 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
             "donetick_url": self._config_entry.data[CONF_URL],
         }
         attributes["show_due_in_days"] = self._show_due_in_days
+        attributes["show_only_today"] = self._show_only_today
         
         # Add circle members data for custom card user selection
         if hasattr(self, '_circle_members'):
