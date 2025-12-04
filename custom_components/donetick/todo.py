@@ -1,4 +1,6 @@
 """Todo for Donetick integration."""
+from __future__ import annotations
+
 import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
@@ -11,7 +13,7 @@ from homeassistant.components.todo import (
     TodoListEntityFeature,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
@@ -139,6 +141,9 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
         """Initialize the Todo List."""
         super().__init__(coordinator)
         self._config_entry = config_entry
+        self._display_tasks: list[DonetickTask] = []
+        self._tasks_checksum: str | None = None
+        self._attr_todo_items: list[TodoItem] | None = None
         raw_show_due_in = config_entry.options.get(
             CONF_SHOW_DUE_IN,
             config_entry.data.get(CONF_SHOW_DUE_IN, 7),
@@ -168,6 +173,47 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
         filtered_tasks = self._filter_tasks(self.coordinator.data)
         filtered_tasks = self._filter_by_due_window(filtered_tasks)
         return [task for task in filtered_tasks if task.is_active]
+
+    def _build_todo_items(self, tasks: list[DonetickTask]) -> list[TodoItem]:
+        """Convert Donetick tasks into Home Assistant todo items."""
+        return [
+            TodoItem(
+                summary=task.name,
+                uid="%s--%s" % (task.id, task.next_due_date),
+                status=self.get_status(task.next_due_date, task.is_active),
+                due=task.next_due_date,
+                description=task.description or "",
+            )
+            for task in tasks
+        ]
+
+    def _calculate_checksum(self, tasks: list[DonetickTask]) -> str | None:
+        """Generate a signature for the current task list."""
+        if not tasks:
+            return None
+
+        sorted_tasks = sorted(tasks, key=lambda task: task.id)
+        signature_parts: list[str] = []
+        for task in sorted_tasks:
+            due_part = (
+                task.next_due_date.isoformat()
+                if task.next_due_date
+                else ""
+            )
+            updated_part = getattr(task, "updated_at", "") or ""
+            signature_parts.append(
+                ":".join(
+                    (
+                        str(task.id),
+                        due_part,
+                        str(int(task.is_active)),
+                        updated_part,
+                    )
+                )
+            )
+
+        signature_source = "|".join(signature_parts)
+        return hashlib.sha256(signature_source.encode()).hexdigest()[:12]
 
     @staticmethod
     def _coerce_show_due_in(value: Any) -> int | None:
@@ -254,23 +300,7 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
     @property
     def todo_items(self) -> list[TodoItem] | None:
         """Return a list of todo items."""
-        if not self.coordinator or self.coordinator.data is None:
-            return None
-
-        display_tasks = self._get_display_tasks()
-        if not display_tasks:
-            return []
-
-        return [
-            TodoItem(
-                summary=task.name,
-                uid="%s--%s" % (task.id, task.next_due_date),
-                status=self.get_status(task.next_due_date, task.is_active),
-                due=task.next_due_date,
-                description=task.description or ""
-            )
-            for task in display_tasks
-        ]
+        return self._attr_todo_items
 
     def get_status(
         self, due_date: datetime | None, is_active: bool
@@ -301,36 +331,25 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
                 for member in self._circle_members
             ]
 
-        display_tasks = self._get_display_tasks()
-        if display_tasks:
-            sorted_tasks = sorted(display_tasks, key=lambda task: task.id)
-            signature_parts: list[str] = []
-            for task in sorted_tasks:
-                due_part = (
-                    task.next_due_date.isoformat()
-                    if task.next_due_date
-                    else ""
-                )
-                updated_part = getattr(task, "updated_at", "") or ""
-                signature_parts.append(
-                    ":".join(
-                        (
-                            str(task.id),
-                            due_part,
-                            str(int(task.is_active)),
-                            updated_part,
-                        )
-                    )
-                )
-
-            signature_source = "|".join(signature_parts)
-            attributes["tasks_checksum"] = hashlib.sha256(
-                signature_source.encode()
-            ).hexdigest()[:12]
-        else:
-            attributes["tasks_checksum"] = None
+        attributes["tasks_checksum"] = self._tasks_checksum
         
         return attributes
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """React to coordinator updates with filtered task cache."""
+        if not self.coordinator.data:
+            self._display_tasks = []
+            self._attr_todo_items = []
+            self._tasks_checksum = None
+        else:
+            self._display_tasks = self._get_display_tasks()
+            self._attr_todo_items = self._build_todo_items(self._display_tasks)
+            self._tasks_checksum = self._calculate_checksum(
+                self._display_tasks
+            )
+
+        super()._handle_coordinator_update()
 
     async def async_create_todo_item(self, item: TodoItem) -> None:
         """Create a todo item."""
@@ -354,8 +373,9 @@ class DonetickTodoListBase(CoordinatorEntity, TodoListEntity):
 
             create_kwargs: dict[str, Any] = {
                 "name": item.summary,
-                "description": item.description,
             }
+            if item.description is not None:
+                create_kwargs["description"] = item.description
             if due_date is not None:
                 create_kwargs["due_date"] = due_date
             if created_by is not None:
